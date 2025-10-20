@@ -66,6 +66,8 @@ PID_SLEEP=0		# ProcessID of current background "sleep"
 IPV4_REGEX="[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}"
 # IPv6       ( ( 0-9a-f  1-4char ":") min 1x) ( ( 0-9a-f  1-4char   )optional) ( (":" 0-9a-f 1-4char  ) min 1x)
 IPV6_REGEX="\(\([0-9A-Fa-f]\{1,4\}:\)\{1,\}\)\(\([0-9A-Fa-f]\{1,4\}\)\{0,1\}\)\(\(:[0-9A-Fa-f]\{1,4\}\)\{1,\}\)"
+# Regular MAC validation is required when ip_source='device'; keep format strict to avoid false positives
+MAC_REGEX="([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"
 
 # characters that are dangerous to pass to a shell command line
 SHELL_ESCAPE="[\"\'\`\$\!();><{}?|\[\]\*\\\\]"
