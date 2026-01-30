@@ -300,6 +300,16 @@ if [ "$ip_source" = "device" ]; then
 	[ -n "$ip_interface" ] || [ -n "$ip_network" ] || write_log 14 "Service section not configured correctly! 'device' source needs 'ip_interface' or 'ip_network'"
 fi
 
+if [ "$ip_source" = "prefix" ]; then
+	[ "$use_ipv6" -eq 1 ] || write_log 14 "Service section not configured correctly! 'prefix' source requires 'use_ipv6' enabled"
+	[ -n "$ip_network" ] || write_log 14 "Service section not configured correctly! 'prefix' source requires 'ip_network'"
+fi
+
+if [ "$ip_source" = "dhcpv6" ] || [ "$ip_source" = "slaac" ] || [ "$ip_source" = "eui64" ]; then
+	[ "$use_ipv6" -eq 1 ] || write_log 14 "Service section not configured correctly! '$ip_source' source requires 'use_ipv6' enabled"
+	[ -n "$ip_interface" ] || [ -n "$ip_network" ] || write_log 14 "Service section not configured correctly! '$ip_source' source needs 'ip_interface' or 'ip_network'"
+fi
+
 # compute update interval in seconds
 get_seconds CHECK_SECONDS ${check_interval:-10} ${check_unit:-"minutes"} # default 10 min
 get_seconds FORCE_SECONDS ${force_interval:-72} ${force_unit:-"hours"}	 # default 3 days

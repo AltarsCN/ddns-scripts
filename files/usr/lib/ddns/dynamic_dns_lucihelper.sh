@@ -41,7 +41,12 @@ Parameters:
  -s SCRIPT           => ip_script=SCRIPT; ip_source="script"
  -t                  => force_dnstcp=1      (default 0)
  -u URL              => ip_url=URL; ip_source="web"
--M MAC              => ip_device=MAC; ip_source="device"
+ -M MAC              => ip_device=MAC; ip_source="device"
+ -P                  => ip_source="prefix" (IPv6 PD)
+ -D                  => ip_source="dhcpv6" (DHCPv6 address)
+ -A                  => ip_source="slaac" (SLAAC address)
+ -E                  => ip_source="eui64" (EUI-64 address)
+ -x SUFFIX           => ip_prefix_suffix=SUFFIX (for prefix source)
  -S SECTION          SECTION to [start|stop]
 
  -h                  => show this help and exit
@@ -273,7 +278,7 @@ force_dnstcp=0		# Force TCP on DNS - default 0 - No
 is_glue=0		# Is glue record - default 0 - No
 use_https=0		# not needed but must be set
 
-while getopts ":6d:fghi:l:n:p:s:M:S:tu:Lv:V" OPT; do
+while getopts ":6d:fghi:l:n:p:s:M:S:tu:Lv:VPDAEx:" OPT; do
 	case "$OPT" in
 		6)	use_ipv6=1;;
 		d)	dns_server="$OPTARG";;
@@ -285,6 +290,11 @@ while getopts ":6d:fghi:l:n:p:s:M:S:tu:Lv:V" OPT; do
 		p)	proxy="$OPTARG";;
 		s)	ip_script="$OPTARG"; ip_source="script";;
 		M)	ip_device=$(printf "%s" "$OPTARG" | tr 'A-F' 'a-f'); ip_source="device"; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
+		P)	ip_source="prefix"; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
+		D)	ip_source="dhcpv6"; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
+		A)	ip_source="slaac"; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
+		E)	ip_source="eui64"; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
+		x)	ip_prefix_suffix="$OPTARG";;
 		t)	force_dnstcp=1;;
 		u)	ip_url="$OPTARG"; ip_source="web";;
 		h)	usage; exit 255;;
@@ -374,14 +384,14 @@ case "$1" in
 			"$DDNSPRG" -- stop
 		fi
 		;;
-		list_neighbors)
-			if [ -z "$ip_interface" ] && [ -n "$ip_network" ]; then
-				network_get_device ip_interface "$ip_network" || usage_err "command 'list_neighbors': unable to resolve network '$ip_network'"
-			fi
-			[ -n "$ip_interface" ] || usage_err "command 'list_neighbors': 'ip_interface' or 'ip_network' required"
-			list_device_neighbors "$ip_interface"
-			__RET=$?
-			;;
+	list_neighbors)
+		if [ -z "$ip_interface" ] && [ -n "$ip_network" ]; then
+			network_get_device ip_interface "$ip_network" || usage_err "command 'list_neighbors': unable to resolve network '$ip_network'"
+		fi
+		[ -n "$ip_interface" ] || usage_err "command 'list_neighbors': 'ip_interface' or 'ip_network' required"
+		list_device_neighbors "$ip_interface"
+		__RET=$?
+		;;
 	*)
 		__RET=255
 		;;
@@ -390,4 +400,4 @@ esac
 # remove out and err file
 [ -f "$DATFILE" ] && rm -f "$DATFILE"
 [ -f "$ERRFILE" ] && rm -f "$ERRFILE"
-return $__RET
+exit $__RET

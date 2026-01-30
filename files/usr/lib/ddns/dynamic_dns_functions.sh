@@ -490,6 +490,196 @@ sanitize_variable() {
 	fi
 }
 
+# Get IPv6 prefix delegation (PD) from a network
+# $1	network name (e.g., wan6)
+# $2	variable name to store the prefix
+get_ipv6_prefix() {
+	local __NETWORK="$1"
+	local __VAR="$2"
+	local __PREFIX=""
+	local __JSON __PREFIXES __INDEX __PREFIX_ADDR __PREFIX_MASK
+
+	[ -n "$__NETWORK" ] || return 1
+	[ -n "$__VAR" ] || return 1
+
+	# Method 1: Use netifd ubus interface
+	if [ -n "$UBUS" ]; then
+		__JSON=$($UBUS call network.interface."$__NETWORK" status 2>/dev/null)
+		if [ -n "$__JSON" ]; then
+			. /usr/share/libubox/jshn.sh
+			if json_load "$__JSON" 2>/dev/null; then
+				# Check for IPv6 prefix in "ipv6-prefix" array
+				if json_select "ipv6-prefix" 2>/dev/null; then
+					json_select 1 2>/dev/null && {
+						json_get_var __PREFIX_ADDR "address"
+						json_get_var __PREFIX_MASK "mask"
+						if [ -n "$__PREFIX_ADDR" ] && [ -n "$__PREFIX_MASK" ]; then
+							__PREFIX="${__PREFIX_ADDR}/${__PREFIX_MASK}"
+						fi
+						json_select ".."
+					}
+					json_select ".."
+				fi
+				# If no prefix, check "ipv6-prefix-assignment"
+				if [ -z "$__PREFIX" ] && json_select "ipv6-prefix-assignment" 2>/dev/null; then
+					json_select 1 2>/dev/null && {
+						json_get_var __PREFIX_ADDR "address"
+						json_get_var __PREFIX_MASK "mask"
+						if [ -n "$__PREFIX_ADDR" ] && [ -n "$__PREFIX_MASK" ]; then
+							__PREFIX="${__PREFIX_ADDR}/${__PREFIX_MASK}"
+						fi
+						json_select ".."
+					}
+					json_select ".."
+				fi
+				json_cleanup
+			fi
+		fi
+	fi
+
+	[ -n "$__PREFIX" ] || return 1
+	eval "$__VAR=\"$__PREFIX\""
+	return 0
+}
+
+# Build an IPv6 address from a prefix and interface identifier
+# $1	IPv6 prefix (e.g., 2001:db8:1234::/48)
+# $2	Interface identifier suffix (e.g., ::1 or host portion)
+# $3	variable name to store the result
+build_ipv6_from_prefix() {
+	local __PREFIX="$1"
+	local __SUFFIX="$2"
+	local __VAR="$3"
+	local __PREFIX_ADDR __PREFIX_LEN __RESULT
+
+	[ -n "$__PREFIX" ] || return 1
+	[ -n "$__SUFFIX" ] || return 1
+	[ -n "$__VAR" ] || return 1
+
+	# Extract prefix address and length
+	__PREFIX_ADDR="${__PREFIX%%/*}"
+	__PREFIX_LEN="${__PREFIX##*/}"
+
+	# Remove trailing ::
+	__PREFIX_ADDR="${__PREFIX_ADDR%%::*}"
+	# Remove leading ::
+	__SUFFIX="${__SUFFIX##*::}"
+
+	# Combine prefix and suffix
+	if [ -n "$__SUFFIX" ]; then
+		__RESULT="${__PREFIX_ADDR}::${__SUFFIX}"
+	else
+		__RESULT="${__PREFIX_ADDR}::1"
+	fi
+
+	eval "$__VAR=\"$__RESULT\""
+	return 0
+}
+
+# Get IPv6 address with specific type filtering
+# $1	interface/device name
+# $2	variable name to store result
+# $3	address type filter: "global" (default), "ula", "temporary", "dhcpv6", "slaac", "any"
+get_ipv6_address_filtered() {
+	local __DEVICE="$1"
+	local __VAR="$2"
+	local __TYPE="${3:-global}"
+	local __ADDR=""
+	local __ADDRS __LINE __IP __SCOPE __FLAGS __PREFERRED=""
+
+	[ -n "$__DEVICE" ] || return 1
+	[ -n "$__VAR" ] || return 1
+
+	# Get all IPv6 addresses for the interface
+	__ADDRS=$(ip -6 addr show dev "$__DEVICE" scope global 2>/dev/null)
+
+	case "$__TYPE" in
+		"global")
+			# Get first global address (not ULA, not link-local)
+			__ADDR=$(echo "$__ADDRS" | awk '
+				/inet6/ {
+					addr=$2; sub(/\/.*/, "", addr)
+					lc=tolower(addr)
+					if (lc !~ /^fe80:/ && lc !~ /^fc[0-9a-f]/ && lc !~ /^fd[0-9a-f]/) {
+						print addr; exit
+					}
+				}')
+			;;
+		"ula")
+			# Get ULA address (fc00::/7)
+			__ADDR=$(echo "$__ADDRS" | awk '
+				/inet6/ {
+					addr=$2; sub(/\/.*/, "", addr)
+					lc=tolower(addr)
+					if (lc ~ /^fc[0-9a-f]/ || lc ~ /^fd[0-9a-f]/) {
+						print addr; exit
+					}
+				}')
+			;;
+		"temporary"|"privacy")
+			# Get temporary/privacy address (has "temporary" flag)
+			__ADDR=$(echo "$__ADDRS" | awk '
+				/inet6.*temporary/ {
+					addr=$2; sub(/\/.*/, "", addr)
+					lc=tolower(addr)
+					if (lc !~ /^fe80:/) { print addr; exit }
+				}')
+			;;
+		"dhcpv6")
+			# DHCPv6 addresses typically don't have "mngtmpaddr" flag
+			# and don't have "temporary" flag - they are managed addresses
+			__ADDR=$(echo "$__ADDRS" | awk '
+				/inet6/ && !/mngtmpaddr/ && !/temporary/ {
+					addr=$2; sub(/\/.*/, "", addr)
+					lc=tolower(addr)
+					if (lc !~ /^fe80:/ && lc !~ /^fc[0-9a-f]/ && lc !~ /^fd[0-9a-f]/) {
+						print addr; exit
+					}
+				}')
+			;;
+		"slaac")
+			# SLAAC addresses have "mngtmpaddr" flag (managed by kernel)
+			__ADDR=$(echo "$__ADDRS" | awk '
+				/inet6.*mngtmpaddr/ && !/temporary/ {
+					addr=$2; sub(/\/.*/, "", addr)
+					lc=tolower(addr)
+					if (lc !~ /^fe80:/) { print addr; exit }
+				}')
+			;;
+		"eui64")
+			# EUI-64 based address (derived from MAC)
+			__ADDR=$(echo "$__ADDRS" | awk '
+				/inet6/ && !/temporary/ {
+					addr=$2; sub(/\/.*/, "", addr)
+					# EUI-64 addresses have ff:fe in the middle of interface ID
+					if (tolower(addr) ~ /ff:?fe/) { print addr; exit }
+				}')
+			;;
+		"stable-privacy")
+			# Stable privacy addresses (RFC 7217) - global but not EUI-64 or temporary
+			__ADDR=$(echo "$__ADDRS" | awk '
+				/inet6/ && !/temporary/ && /stable-privacy/ {
+					addr=$2; sub(/\/.*/, "", addr)
+					lc=tolower(addr)
+					if (lc !~ /^fe80:/) { print addr; exit }
+				}')
+			;;
+		"any"|*)
+			# Get any available global address
+			__ADDR=$(echo "$__ADDRS" | awk '
+				/inet6/ {
+					addr=$2; sub(/\/.*/, "", addr)
+					lc=tolower(addr)
+					if (lc !~ /^fe80:/) { print addr; exit }
+				}')
+			;;
+	esac
+
+	[ -n "$__ADDR" ] || return 1
+	eval "$__VAR=\"$__ADDR\""
+	return 0
+}
+
 # Return IPv6 for device+MAC; prefer globals while keeping ULA as fallback
 get_device_ipv6_address() {
 	# $1	interface device name
@@ -554,7 +744,13 @@ get_device_ipv6_address() {
 			raw=$1
 			sub(/%.*/, "", raw)
 			lladdr=""
-			for (i=1; i<=NF; i++) if ($i=="lladdr") { lladdr=$(i+1); break }
+			state=""
+			for (i=1; i<=NF; i++) {
+				if ($i=="lladdr") { lladdr=$(i+1) }
+				if ($i=="FAILED" || $i=="INCOMPLETE") { state=$i }
+			}
+			# Skip entries without MAC or with FAILED/INCOMPLETE state
+			if (state=="FAILED" || state=="INCOMPLETE") next
 			if (tolower(lladdr)==mac) {
 				addr_lc=tolower(raw)
 				if (addr_lc ~ /^fe80:/) next
@@ -946,9 +1142,10 @@ send_update() {
 	[ $# -ne 1 ] && write_log 12 "Error calling 'send_update()' - wrong number of parameters"
 
 	if [ $upd_privateip -eq 0 ]; then
-		# verify given IP / no private IPv4's / no IPv6 addr starting with fxxx of with ":"
+		# verify given IP / no private IPv4's / no IPv6 private addresses
 		[ $use_ipv6 -eq 0 ] && __IP=$(echo $1 | grep -v -E "(^0|^10\.|^100\.6[4-9]\.|^100\.[7-9][0-9]\.|^100\.1[0-1][0-9]\.|^100\.12[0-7]\.|^127|^169\.254|^172\.1[6-9]\.|^172\.2[0-9]\.|^172\.3[0-1]\.|^192\.168)")
-		[ $use_ipv6 -eq 1 ] && __IP=$(echo $1 | grep "^[0-9a-eA-E]")
+		# IPv6: exclude ULA (fc/fd), link-local (fe80), loopback (::1), multicast (ff), and invalid (::)
+		[ $use_ipv6 -eq 1 ] && __IP=$(echo $1 | grep -i -v -E "^(fc|fd|fe80|ff|::1$|::$)" | grep -m 1 -o "$IPV6_REGEX")
 	else
 		__IP=$(echo $1 | grep -m 1 -o "$IPV4_REGEX")		# valid IPv4 or
 		[ -z "$__IP" ] && __IP=$(echo $1 | grep -m 1 -o "$IPV6_REGEX")	# IPv6
@@ -1047,6 +1244,81 @@ get_current_ip () {
 			[ -n "$__DEVNAME" ] || { write_log 12 "get_current_ip: No usable interface resolved for source 'device'"; return 2; }
 			data=$(get_device_ipv6_address "$__DEVNAME" "$ip_device")
 			[ -n "$data" ] && write_log 7 "Current IP '$data' detected for device '$ip_device' on '$__DEVNAME'"
+			;;
+		"prefix")
+			# IPv6 Prefix Delegation - build address from PD prefix
+			[ "$use_ipv6" -eq 1 ] || { write_log 12 "get_current_ip: 'prefix' source requires 'use_ipv6' enabled"; return 2; }
+			[ -n "$ip_network" ] || { write_log 12 "get_current_ip: 'ip_network' not set for source 'prefix'"; return 2; }
+			local __PREFIX="" __SUFFIX="${ip_prefix_suffix:-::1}"
+			if get_ipv6_prefix "$ip_network" __PREFIX; then
+				build_ipv6_from_prefix "$__PREFIX" "$__SUFFIX" data
+				[ -n "$data" ] && write_log 7 "Current IP '$data' built from prefix '$__PREFIX' + suffix '$__SUFFIX'"
+			else
+				write_log 4 "No IPv6 prefix found on network '$ip_network'"
+			fi
+			;;
+		"dhcpv6")
+			# DHCPv6 assigned address
+			[ "$use_ipv6" -eq 1 ] || { write_log 12 "get_current_ip: 'dhcpv6' source requires 'use_ipv6' enabled"; return 2; }
+			local __DEVNAME=""
+			if [ -n "$ip_interface" ]; then
+				if [ "${ip_interface#@}" != "$ip_interface" ]; then
+					network_get_device __DEVNAME "${ip_interface#@}" 2>/dev/null
+				else
+					__DEVNAME="$ip_interface"
+				fi
+			elif [ -n "$ip_network" ]; then
+				network_get_device __DEVNAME "$ip_network" 2>/dev/null
+			fi
+			if [ -n "$__DEVNAME" ]; then
+				get_ipv6_address_filtered "$__DEVNAME" data "dhcpv6"
+				[ -n "$data" ] && write_log 7 "Current DHCPv6 IP '$data' detected on '$__DEVNAME'"
+			else
+				write_log 12 "get_current_ip: 'dhcpv6' source requires 'ip_interface' or 'ip_network'"
+				return 2
+			fi
+			;;
+		"slaac")
+			# SLAAC (Stateless Address Auto-Configuration) address
+			[ "$use_ipv6" -eq 1 ] || { write_log 12 "get_current_ip: 'slaac' source requires 'use_ipv6' enabled"; return 2; }
+			local __DEVNAME=""
+			if [ -n "$ip_interface" ]; then
+				if [ "${ip_interface#@}" != "$ip_interface" ]; then
+					network_get_device __DEVNAME "${ip_interface#@}" 2>/dev/null
+				else
+					__DEVNAME="$ip_interface"
+				fi
+			elif [ -n "$ip_network" ]; then
+				network_get_device __DEVNAME "$ip_network" 2>/dev/null
+			fi
+			if [ -n "$__DEVNAME" ]; then
+				get_ipv6_address_filtered "$__DEVNAME" data "slaac"
+				[ -n "$data" ] && write_log 7 "Current SLAAC IP '$data' detected on '$__DEVNAME'"
+			else
+				write_log 12 "get_current_ip: 'slaac' source requires 'ip_interface' or 'ip_network'"
+				return 2
+			fi
+			;;
+		"eui64")
+			# EUI-64 based IPv6 address (derived from MAC)
+			[ "$use_ipv6" -eq 1 ] || { write_log 12 "get_current_ip: 'eui64' source requires 'use_ipv6' enabled"; return 2; }
+			local __DEVNAME=""
+			if [ -n "$ip_interface" ]; then
+				if [ "${ip_interface#@}" != "$ip_interface" ]; then
+					network_get_device __DEVNAME "${ip_interface#@}" 2>/dev/null
+				else
+					__DEVNAME="$ip_interface"
+				fi
+			elif [ -n "$ip_network" ]; then
+				network_get_device __DEVNAME "$ip_network" 2>/dev/null
+			fi
+			if [ -n "$__DEVNAME" ]; then
+				get_ipv6_address_filtered "$__DEVNAME" data "eui64"
+				[ -n "$data" ] && write_log 7 "Current EUI-64 IP '$data' detected on '$__DEVNAME'"
+			else
+				write_log 12 "get_current_ip: 'eui64' source requires 'ip_interface' or 'ip_network'"
+				return 2
+			fi
 			;;
 		*)
 			write_log 12 "get_current_ip: Unsupported source '$ip_source'"
