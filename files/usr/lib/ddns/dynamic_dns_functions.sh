@@ -89,6 +89,7 @@ HOSTIP=$(command -v hostip)
 NSLOOKUP=$(command -v nslookup)
 RESOLVEIP=$(command -v resolveip)
 jsonfilter=$(command -v jsonfilter)
+UBUS=$(command -v ubus)
 
 # Transfer Programs
 WGET=$(command -v wget)
@@ -498,6 +499,7 @@ get_ipv6_prefix() {
 	local __VAR="$2"
 	local __PREFIX=""
 	local __JSON __PREFIXES __INDEX __PREFIX_ADDR __PREFIX_MASK
+	local __DEVNAME __ADDR_LINE
 
 	[ -n "$__NETWORK" ] || return 1
 	[ -n "$__VAR" ] || return 1
@@ -533,6 +535,46 @@ get_ipv6_prefix() {
 					json_select ".."
 				fi
 				json_cleanup
+			fi
+		fi
+	fi
+
+	# Method 2: Fallback - try to get prefix from interface addresses via ip command
+	if [ -z "$__PREFIX" ]; then
+		network_get_device __DEVNAME "$__NETWORK" 2>/dev/null
+		if [ -n "$__DEVNAME" ]; then
+			# Get the first global IPv6 address with its prefix length
+			__ADDR_LINE=$(ip -6 addr show dev "$__DEVNAME" scope global 2>/dev/null | \
+				awk '/inet6.*\/[0-9]+/ && !/fe80:/ && !/fc[0-9a-f]/ && !/fd[0-9a-f]/ {
+					addr = $2
+					if (addr ~ /::/) {
+						# Extract prefix: keep everything before the interface identifier
+						split(addr, parts, "/")
+						prefix_len = parts[2]
+						ip_part = parts[1]
+						# For typical /64 prefix, extract the network portion
+						if (prefix_len <= 64) {
+							# Remove interface identifier (last 64 bits)
+							n = split(ip_part, segs, ":")
+							prefix = ""
+							# Keep first 4 segments (64 bits)
+							for (i = 1; i <= 4 && i <= n; i++) {
+								if (segs[i] == "") continue
+								if (prefix != "") prefix = prefix ":"
+								prefix = prefix segs[i]
+							}
+							if (prefix != "") {
+								print prefix "::" "/" prefix_len
+								exit
+							}
+						} else {
+							print addr
+							exit
+						}
+					}
+				}')
+			if [ -n "$__ADDR_LINE" ]; then
+				__PREFIX="$__ADDR_LINE"
 			fi
 		fi
 	fi
@@ -600,7 +642,7 @@ get_ipv6_address_filtered() {
 				/inet6/ {
 					addr=$2; sub(/\/.*/, "", addr)
 					lc=tolower(addr)
-					if (lc !~ /^fe80:/ && lc !~ /^fc[0-9a-f]/ && lc !~ /^fd[0-9a-f]/) {
+					if (lc !~ /^fe80:/ && lc !~ /^f[cd][0-9a-f][0-9a-f]:/) {
 						print addr; exit
 					}
 				}')
@@ -611,7 +653,7 @@ get_ipv6_address_filtered() {
 				/inet6/ {
 					addr=$2; sub(/\/.*/, "", addr)
 					lc=tolower(addr)
-					if (lc ~ /^fc[0-9a-f]/ || lc ~ /^fd[0-9a-f]/) {
+					if (lc ~ /^f[cd][0-9a-f][0-9a-f]:/) {
 						print addr; exit
 					}
 				}')
@@ -626,33 +668,67 @@ get_ipv6_address_filtered() {
 				}')
 			;;
 		"dhcpv6")
-			# DHCPv6 addresses typically don't have "mngtmpaddr" flag
-			# and don't have "temporary" flag - they are managed addresses
+			# DHCPv6 addresses: typically have "dynamic" flag but NOT "mngtmpaddr"
+			# Note: This detection is best-effort as kernel doesn't distinguish DHCPv6 vs SLAAC
+			# DHCPv6 addresses usually don't have mngtmpaddr since they're not used for generating temp addrs
 			__ADDR=$(echo "$__ADDRS" | awk '
-				/inet6/ && !/mngtmpaddr/ && !/temporary/ {
+				/inet6/ && /dynamic/ && !/mngtmpaddr/ && !/temporary/ {
 					addr=$2; sub(/\/.*/, "", addr)
 					lc=tolower(addr)
-					if (lc !~ /^fe80:/ && lc !~ /^fc[0-9a-f]/ && lc !~ /^fd[0-9a-f]/) {
+					if (lc !~ /^fe80:/ && lc !~ /^f[cd][0-9a-f][0-9a-f]:/) {
 						print addr; exit
 					}
 				}')
+			# Fallback: if no dynamic address found, try any non-temporary non-EUI64 global address
+			if [ -z "$__ADDR" ]; then
+				__ADDR=$(echo "$__ADDRS" | awk '
+					/inet6/ && !/temporary/ {
+						addr=$2; sub(/\/.*/, "", addr)
+						lc=tolower(addr)
+						# Skip EUI-64 addresses (have fffe pattern) - prefer DHCPv6-like addresses
+						if (lc !~ /^fe80:/ && lc !~ /^f[cd][0-9a-f][0-9a-f]:/ && lc !~ /fffe/) {
+							print addr; exit
+						}
+					}')
+			fi
 			;;
 		"slaac")
-			# SLAAC addresses have "mngtmpaddr" flag (managed by kernel)
+			# SLAAC addresses: have "mngtmpaddr" flag (used to manage temporary addresses)
+			# or are EUI-64 based (have fffe pattern in interface ID)
 			__ADDR=$(echo "$__ADDRS" | awk '
-				/inet6.*mngtmpaddr/ && !/temporary/ {
+				/inet6/ && (/mngtmpaddr/ || /autoconf/) && !/temporary/ {
 					addr=$2; sub(/\/.*/, "", addr)
 					lc=tolower(addr)
-					if (lc !~ /^fe80:/) { print addr; exit }
+					if (lc !~ /^fe80:/ && lc !~ /^f[cd][0-9a-f][0-9a-f]:/) {
+						print addr; exit
+					}
 				}')
+			# Fallback: look for EUI-64 pattern which indicates SLAAC
+			if [ -z "$__ADDR" ]; then
+				__ADDR=$(echo "$__ADDRS" | awk '
+					/inet6/ && !/temporary/ {
+						addr=$2; sub(/\/.*/, "", addr)
+						lc=tolower(addr)
+						# EUI-64 has fffe in interface ID - this indicates SLAAC
+						if (lc !~ /^fe80:/ && lc !~ /^f[cd][0-9a-f][0-9a-f]:/ && lc ~ /fffe/) {
+							print addr; exit
+						}
+					}')
+			fi
 			;;
 		"eui64")
-			# EUI-64 based address (derived from MAC)
+			# EUI-64 based address (derived from MAC, has ff:fe or fffe in interface ID)
+			# The pattern appears as xxxx:xxff:fexx:xxxx in the last 64 bits
 			__ADDR=$(echo "$__ADDRS" | awk '
 				/inet6/ && !/temporary/ {
 					addr=$2; sub(/\/.*/, "", addr)
-					# EUI-64 addresses have ff:fe in the middle of interface ID
-					if (tolower(addr) ~ /ff:?fe/) { print addr; exit }
+					lc=tolower(addr)
+					if (lc !~ /^fe80:/ && lc !~ /^f[cd][0-9a-f][0-9a-f]:/) {
+						# Check for fffe pattern (EUI-64 signature)
+						if (lc ~ /[0-9a-f][0-9a-f]ff:fe[0-9a-f][0-9a-f]:/ || lc ~ /fffe/) {
+							print addr; exit
+						}
+					}
 				}')
 			;;
 		"stable-privacy")
@@ -663,15 +739,38 @@ get_ipv6_address_filtered() {
 					lc=tolower(addr)
 					if (lc !~ /^fe80:/) { print addr; exit }
 				}')
+			# Fallback: non-EUI64, non-temporary global addresses
+			if [ -z "$__ADDR" ]; then
+				__ADDR=$(echo "$__ADDRS" | awk '
+					/inet6/ && !/temporary/ {
+						addr=$2; sub(/\/.*/, "", addr)
+						lc=tolower(addr)
+						# Not link-local, not ULA, not EUI-64
+						if (lc !~ /^fe80:/ && lc !~ /^f[cd][0-9a-f][0-9a-f]:/ && lc !~ /fffe/) {
+							print addr; exit
+						}
+					}')
+			fi
 			;;
 		"any"|*)
-			# Get any available global address
+			# Get any available global address (prefer non-ULA)
 			__ADDR=$(echo "$__ADDRS" | awk '
 				/inet6/ {
 					addr=$2; sub(/\/.*/, "", addr)
 					lc=tolower(addr)
-					if (lc !~ /^fe80:/) { print addr; exit }
+					if (lc !~ /^fe80:/ && lc !~ /^f[cd][0-9a-f][0-9a-f]:/) {
+						print addr; exit
+					}
 				}')
+			# Fallback: include ULA if no global found
+			if [ -z "$__ADDR" ]; then
+				__ADDR=$(echo "$__ADDRS" | awk '
+					/inet6/ {
+						addr=$2; sub(/\/.*/, "", addr)
+						lc=tolower(addr)
+						if (lc !~ /^fe80:/) { print addr; exit }
+					}')
+			fi
 			;;
 	esac
 
@@ -712,7 +811,7 @@ get_device_ipv6_address() {
 								__ADDRLOW=$(printf "%s" "$__ADDRVAL" | tr 'A-Z' 'a-z')
 								case "$__ADDRLOW" in
 									fe80:*) ;;
-									fc[0-9a-f]*:*|fd[0-9a-f]*:*)
+									f[cd][0-9a-f][0-9a-f]:*)
 										[ -z "$__ULA_ADDR" ] && __ULA_ADDR="$__ADDRVAL"
 										;;
 									*)
@@ -754,7 +853,7 @@ get_device_ipv6_address() {
 			if (tolower(lladdr)==mac) {
 				addr_lc=tolower(raw)
 				if (addr_lc ~ /^fe80:/) next
-				if (addr_lc ~ /^fc[0-9a-f]/ || addr_lc ~ /^fd[0-9a-f]/) {
+				if (addr_lc ~ /^f[cd][0-9a-f][0-9a-f]:/) {
 					if (!length(ula)) ula=raw
 				} else {
 					global=raw
@@ -769,6 +868,574 @@ get_device_ipv6_address() {
 
 	[ -n "$__ADDR" ] || return 1
 	printf "%s" "$__ADDR"
+	return 0
+}
+
+# Resolve device identifier to MAC address
+# Supports: MAC address, hostname, IPv4 address, DUID
+# $1	device identifier (MAC/hostname/IPv4/DUID)
+# $2	variable name to store resulting MAC address
+# $3	identifier type hint: "auto", "mac", "hostname", "ipv4", "duid" (default: auto)
+resolve_device_to_mac() {
+	local __IDENT="$1"
+	local __VAR="$2"
+	local __TYPE="${3:-auto}"
+	local __MAC=""
+
+	[ -n "$__IDENT" ] || return 1
+	[ -n "$__VAR" ] || return 1
+
+	# Auto-detect identifier type if not specified
+	if [ "$__TYPE" = "auto" ]; then
+		case "$__IDENT" in
+			# MAC address pattern: xx:xx:xx:xx:xx:xx or xx-xx-xx-xx-xx-xx
+			[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F])
+				__TYPE="mac" ;;
+			[0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F])
+				__TYPE="mac" ;;
+			# IPv4 address pattern
+			[0-9]*.[0-9]*.[0-9]*.[0-9]*)
+				__TYPE="ipv4" ;;
+			# DUID pattern: usually starts with 00:0[1-4]: for DUID-LLT/EN/LL/UUID
+			00:0[1-4]:*)
+				__TYPE="duid" ;;
+			# Assume hostname for anything else
+			*)
+				__TYPE="hostname" ;;
+		esac
+	fi
+
+	case "$__TYPE" in
+		"mac")
+			# Normalize MAC format to lowercase with colons
+			__MAC=$(printf "%s" "$__IDENT" | tr 'A-Z-' 'a-z:')
+			;;
+
+		"hostname")
+			# Lookup MAC by hostname from DHCP leases
+			# Try dnsmasq lease file first
+			if [ -f /tmp/dhcp.leases ]; then
+				# Format: timestamp mac ip hostname clientid
+				__MAC=$(awk -v host="$__IDENT" '
+					tolower($4)==tolower(host) { print tolower($2); exit }
+				' /tmp/dhcp.leases)
+			fi
+			# Try odhcpd hosts file
+			if [ -z "$__MAC" ] && [ -f /tmp/hosts/odhcpd ]; then
+				__MAC=$(awk -v host="$__IDENT" '
+					tolower($2)==tolower(host) || tolower($3)==tolower(host) {
+						# Try to extract MAC from DUID or other fields
+						for(i=1;i<=NF;i++) {
+							if ($i ~ /^[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]$/) {
+								print $i; exit
+							}
+						}
+					}
+				' /tmp/hosts/odhcpd)
+			fi
+			# Try ubus dhcp if available
+			if [ -z "$__MAC" ] && [ -n "$UBUS" ]; then
+				__MAC=$($UBUS call dhcp ipv4leases 2>/dev/null | jsonfilter -e "@.device[*].leases[@.hostname='$__IDENT'].mac" 2>/dev/null | head -1)
+			fi
+			;;
+
+		"ipv4")
+			# Lookup MAC by IPv4 address
+			# Try dnsmasq lease file
+			if [ -f /tmp/dhcp.leases ]; then
+				__MAC=$(awk -v ip="$__IDENT" '
+					$3==ip { print tolower($2); exit }
+				' /tmp/dhcp.leases)
+			fi
+			# Try ARP table as fallback
+			if [ -z "$__MAC" ]; then
+				__MAC=$(ip neigh show "$__IDENT" 2>/dev/null | awk '/lladdr/ {print tolower($5)}' | head -1)
+			fi
+			# Try ubus dhcp
+			if [ -z "$__MAC" ] && [ -n "$UBUS" ]; then
+				__MAC=$($UBUS call dhcp ipv4leases 2>/dev/null | jsonfilter -e "@.device[*].leases[@.address='$__IDENT'].mac" 2>/dev/null | head -1)
+			fi
+			;;
+
+		"duid")
+			# Lookup MAC by DUID from DHCPv6 leases
+			# odhcpd stores DHCPv6 info via ubus
+			if [ -n "$UBUS" ]; then
+				__MAC=$($UBUS call dhcp ipv6leases 2>/dev/null | jsonfilter -e "@.device[*].leases[@.duid='$__IDENT'].mac" 2>/dev/null | head -1)
+			fi
+			# Try parsing odhcpd state file
+			if [ -z "$__MAC" ] && [ -f /tmp/hosts/odhcpd ]; then
+				# odhcpd format varies, try common patterns
+				__MAC=$(grep -i "$__IDENT" /tmp/hosts/odhcpd 2>/dev/null | awk '
+				{
+					for(i=1;i<=NF;i++) {
+						if ($i ~ /^[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]$/) {
+							print tolower($i); exit
+						}
+					}
+				}')
+			fi
+			# Extract MAC from DUID-LL or DUID-LLT (Type 1 or 3)
+			# DUID-LLT: 00:01:00:01:xx:xx:xx:xx:MAC (type:hwtype:time:mac)
+			# DUID-LL:  00:03:00:01:MAC (type:hwtype:mac)
+			if [ -z "$__MAC" ]; then
+				case "$__IDENT" in
+					00:01:00:01:??:??:??:??:*)
+						# DUID-LLT: skip first 10 bytes (00:01:00:01:tt:tt:tt:tt:)
+						__MAC=$(printf "%s" "$__IDENT" | cut -d: -f9-14 | tr 'A-Z' 'a-z')
+						;;
+					00:03:00:01:*)
+						# DUID-LL: skip first 4 bytes (00:03:00:01:)
+						__MAC=$(printf "%s" "$__IDENT" | cut -d: -f5-10 | tr 'A-Z' 'a-z')
+						;;
+				esac
+			fi
+			;;
+	esac
+
+	[ -z "$__MAC" ] && return 1
+
+	eval "$__VAR=\"$__MAC\""
+	return 0
+}
+
+# Get IPv6 address directly from DHCPv6 lease by DUID
+# $1	DUID string (e.g., "00020000ab11...")
+# $2	address type filter: "global", "ula", "any"
+# $3	variable name to store result
+get_dhcpv6_ipv6_by_duid() {
+	local __DUID="$1"
+	local __ADDR_TYPE="${2:-any}"
+	local __VAR="$3"
+	local __ADDR=""
+	local __ULA_ADDR=""
+	local __GLOBAL_ADDR=""
+
+	[ -n "$__DUID" ] || return 1
+	[ -n "$__VAR" ] || return 1
+
+	# Normalize DUID: remove colons/dashes for comparison
+	local __DUID_NORM
+	__DUID_NORM=$(printf "%s" "$__DUID" | tr -d ':-' | tr 'A-Z' 'a-z')
+
+	if [ -n "$UBUS" ]; then
+		local __JSON
+		__JSON=$($UBUS call dhcp ipv6leases 2>/dev/null)
+		[ -n "$__JSON" ] || return 1
+
+		# Get all leases and find matching DUID
+		local __ALL_DUIDS __CURR_DUID __CURR_DUID_NORM
+		__ALL_DUIDS=$(echo "$__JSON" | jsonfilter -e '@.device.*.leases[*].duid' 2>/dev/null)
+
+		for __CURR_DUID in $__ALL_DUIDS; do
+			__CURR_DUID_NORM=$(printf "%s" "$__CURR_DUID" | tr -d ':-' | tr 'A-Z' 'a-z')
+			if [ "$__CURR_DUID_NORM" = "$__DUID_NORM" ]; then
+				# Found matching DUID, get IPv6 addresses
+				# Use jsonfilter with proper bracket notation for ipv6-addr
+				local __ADDRS
+				__ADDRS=$(echo "$__JSON" | jsonfilter -e "@.device.*.leases[@.duid=\"$__CURR_DUID\"][\"ipv6-addr\"][*].address" 2>/dev/null)
+
+				for addr in $__ADDRS; do
+					local addr_lc
+					addr_lc=$(printf "%s" "$addr" | tr 'A-Z' 'a-z')
+					case "$addr_lc" in
+						fe80:*) continue ;;
+						f[cd][0-9a-f][0-9a-f]:*)
+							[ -z "$__ULA_ADDR" ] && __ULA_ADDR="$addr"
+							;;
+						*)
+							__GLOBAL_ADDR="$addr"
+							break 2
+							;;
+					esac
+				done
+				break
+			fi
+		done
+	fi
+
+	case "$__ADDR_TYPE" in
+		"global") __ADDR="$__GLOBAL_ADDR" ;;
+		"ula") __ADDR="$__ULA_ADDR" ;;
+		*) __ADDR="${__GLOBAL_ADDR:-$__ULA_ADDR}" ;;
+	esac
+
+	[ -z "$__ADDR" ] && return 1
+
+	eval "$__VAR=\"$__ADDR\""
+	return 0
+}
+
+# Get IPv6 address directly from DHCPv6 lease by hostname
+# $1	hostname
+# $2	address type filter: "global", "ula", "any"
+# $3	variable name to store result
+get_dhcpv6_ipv6_by_hostname() {
+	local __HOSTNAME="$1"
+	local __ADDR_TYPE="${2:-any}"
+	local __VAR="$3"
+	local __ADDR=""
+	local __ULA_ADDR=""
+	local __GLOBAL_ADDR=""
+
+	[ -n "$__HOSTNAME" ] || return 1
+	[ -n "$__VAR" ] || return 1
+
+	if [ -n "$UBUS" ]; then
+		local __JSON
+		__JSON=$($UBUS call dhcp ipv6leases 2>/dev/null)
+		[ -n "$__JSON" ] || return 1
+
+		# Use jsonfilter with proper bracket notation for ipv6-addr
+		local __ADDRS
+		__ADDRS=$(echo "$__JSON" | jsonfilter -e "@.device.*.leases[@.hostname=\"$__HOSTNAME\"][\"ipv6-addr\"][*].address" 2>/dev/null)
+
+		for addr in $__ADDRS; do
+			local addr_lc
+			addr_lc=$(printf "%s" "$addr" | tr 'A-Z' 'a-z')
+			case "$addr_lc" in
+				fe80:*) continue ;;
+				f[cd][0-9a-f][0-9a-f]:*)
+					[ -z "$__ULA_ADDR" ] && __ULA_ADDR="$addr"
+					;;
+				*)
+					__GLOBAL_ADDR="$addr"
+					break
+					;;
+			esac
+		done
+	fi
+
+	case "$__ADDR_TYPE" in
+		"global") __ADDR="$__GLOBAL_ADDR" ;;
+		"ula") __ADDR="$__ULA_ADDR" ;;
+		*) __ADDR="${__GLOBAL_ADDR:-$__ULA_ADDR}" ;;
+	esac
+
+	[ -z "$__ADDR" ] && return 1
+
+	eval "$__VAR=\"$__ADDR\""
+	return 0
+}
+
+# Get DUID for a device from DHCPv6 leases
+# Can lookup by hostname or MAC address
+# $1	identifier (hostname or MAC)
+# $2	identifier type: "hostname", "mac"
+# $3	variable name to store result
+get_device_duid() {
+	local __IDENT="$1"
+	local __TYPE="${2:-hostname}"
+	local __VAR="$3"
+	local __DUID=""
+
+	[ -n "$__IDENT" ] || return 1
+	[ -n "$__VAR" ] || return 1
+
+	if [ -n "$UBUS" ]; then
+		local __JSON
+		__JSON=$($UBUS call dhcp ipv6leases 2>/dev/null)
+		[ -n "$__JSON" ] || return 1
+
+		case "$__TYPE" in
+			"hostname")
+				__DUID=$(echo "$__JSON" | jsonfilter -e "@.device.*.leases[@.hostname=\"$__IDENT\"].duid" 2>/dev/null | head -1)
+				;;
+			"mac")
+				# DHCPv6 leases typically use DUID which may contain MAC
+				# Search for DUID containing this MAC (DUID-LL or DUID-LLT format)
+				local __MAC_NORM __ALL_DUIDS __CURR_DUID __CURR_DUID_NORM
+				__MAC_NORM=$(printf "%s" "$__IDENT" | tr -d ':-' | tr 'A-Z' 'a-z')
+				__ALL_DUIDS=$(echo "$__JSON" | jsonfilter -e '@.device.*.leases[*].duid' 2>/dev/null)
+				for __CURR_DUID in $__ALL_DUIDS; do
+					__CURR_DUID_NORM=$(printf "%s" "$__CURR_DUID" | tr -d ':-' | tr 'A-Z' 'a-z')
+					# Check if MAC is embedded in DUID
+					case "$__CURR_DUID_NORM" in
+						*"$__MAC_NORM"*)
+							__DUID="$__CURR_DUID"
+							break
+							;;
+					esac
+				done
+				;;
+		esac
+	fi
+
+	[ -z "$__DUID" ] && return 1
+
+	eval "$__VAR=\"$__DUID\""
+	return 0
+}
+
+# Get IPv6 address for a device by various identifiers
+# Uses direct DHCPv6 lookup when possible, falls back to neighbor table
+# $1	interface device name
+# $2	device identifier (MAC/hostname/IPv4/DUID)
+# $3	identifier type: "auto", "mac", "hostname", "ipv4", "duid"
+# $4	address type filter: "global", "ula", "dhcpv6", "slaac", "eui64", "any"
+# $5	variable name to store result
+get_device_ipv6_by_ident() {
+	local __DEVICE="$1"
+	local __IDENT="$2"
+	local __IDENT_TYPE="${3:-auto}"
+	local __ADDR_TYPE="${4:-any}"
+	local __VAR="$5"
+	local __RESULT=""
+	local __RESOLVED_MAC=""
+
+	[ -n "$__DEVICE" ] || return 1
+	[ -n "$__IDENT" ] || return 1
+	[ -n "$__VAR" ] || return 1
+
+	# Auto-detect identifier type if not specified
+	if [ "$__IDENT_TYPE" = "auto" ]; then
+		case "$__IDENT" in
+			[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F])
+				__IDENT_TYPE="mac" ;;
+			[0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F])
+				__IDENT_TYPE="mac" ;;
+			[0-9]*.[0-9]*.[0-9]*.[0-9]*)
+				__IDENT_TYPE="ipv4" ;;
+			00:0[1-4]:*|0001*|0002*|0003*|0004*)
+				__IDENT_TYPE="duid" ;;
+			*)
+				__IDENT_TYPE="hostname" ;;
+		esac
+	fi
+
+	write_log 7 "Looking up device '$__IDENT' (type: $__IDENT_TYPE, addr_type: $__ADDR_TYPE)"
+
+	# Map address type to DHCPv6 filter type
+	local __DHCP_FILTER="any"
+	case "$__ADDR_TYPE" in
+		"global"|"ula"|"any")
+			__DHCP_FILTER="$__ADDR_TYPE"
+			;;
+		"dhcpv6")
+			# DHCPv6 addresses - prefer DHCPv6 lookup
+			__DHCP_FILTER="any"
+			;;
+		*)
+			# slaac, eui64 - these need neighbor table
+			__DHCP_FILTER=""
+			;;
+	esac
+
+	# Strategy: Try direct DHCPv6 lookup first for applicable types
+	case "$__IDENT_TYPE" in
+		"duid")
+			# Direct DHCPv6 lookup by DUID
+			if [ -n "$__DHCP_FILTER" ]; then
+				if get_dhcpv6_ipv6_by_duid "$__IDENT" "$__DHCP_FILTER" __RESULT; then
+					write_log 7 "Found IPv6 '$__RESULT' via DHCPv6 DUID lookup"
+					eval "$__VAR=\"$__RESULT\""
+					return 0
+				fi
+			fi
+			# Fallback: extract MAC from DUID-LL/DUID-LLT and use neighbor table
+			write_log 7 "DHCPv6 DUID lookup failed, trying to extract MAC from DUID"
+			if resolve_device_to_mac "$__IDENT" __RESOLVED_MAC "duid"; then
+				write_log 7 "Extracted MAC '$__RESOLVED_MAC' from DUID, using neighbor table"
+				if get_neighbor_ipv6_filtered "$__DEVICE" "$__RESOLVED_MAC" "$__ADDR_TYPE" __RESULT; then
+					eval "$__VAR=\"$__RESULT\""
+					return 0
+				fi
+			fi
+			;;
+
+		"hostname")
+			# Direct DHCPv6 lookup by hostname
+			if [ -n "$__DHCP_FILTER" ]; then
+				if get_dhcpv6_ipv6_by_hostname "$__IDENT" "$__DHCP_FILTER" __RESULT; then
+					write_log 7 "Found IPv6 '$__RESULT' via DHCPv6 hostname lookup"
+					eval "$__VAR=\"$__RESULT\""
+					return 0
+				fi
+			fi
+			# Fallback: resolve to MAC and use neighbor table
+			write_log 7 "DHCPv6 hostname lookup failed, trying MAC resolution"
+			if resolve_device_to_mac "$__IDENT" __RESOLVED_MAC "hostname"; then
+				write_log 7 "Resolved hostname to MAC '$__RESOLVED_MAC', using neighbor table"
+				if get_neighbor_ipv6_filtered "$__DEVICE" "$__RESOLVED_MAC" "$__ADDR_TYPE" __RESULT; then
+					eval "$__VAR=\"$__RESULT\""
+					return 0
+				fi
+			fi
+			;;
+
+		"ipv4")
+			# Try to find DUID via hostname from DHCPv4 lease, then DHCPv6 lookup
+			local __HOSTNAME_FROM_IP=""
+			if [ -f /tmp/dhcp.leases ]; then
+				__HOSTNAME_FROM_IP=$(awk -v ip="$__IDENT" '$3==ip && $4!="*" {print $4; exit}' /tmp/dhcp.leases)
+			fi
+			if [ -n "$__HOSTNAME_FROM_IP" ] && [ -n "$__DHCP_FILTER" ]; then
+				if get_dhcpv6_ipv6_by_hostname "$__HOSTNAME_FROM_IP" "$__DHCP_FILTER" __RESULT; then
+					write_log 7 "Found IPv6 '$__RESULT' via DHCPv6 (IPv4->hostname->DHCPv6)"
+					eval "$__VAR=\"$__RESULT\""
+					return 0
+				fi
+			fi
+			# Fallback: resolve IPv4 to MAC and use neighbor table
+			if resolve_device_to_mac "$__IDENT" __RESOLVED_MAC "ipv4"; then
+				write_log 7 "Resolved IPv4 to MAC '$__RESOLVED_MAC', using neighbor table"
+				if get_neighbor_ipv6_filtered "$__DEVICE" "$__RESOLVED_MAC" "$__ADDR_TYPE" __RESULT; then
+					eval "$__VAR=\"$__RESULT\""
+					return 0
+				fi
+			fi
+			;;
+
+		"mac")
+			# Try to find device in DHCPv6 by MAC embedded in DUID
+			local __DEVICE_DUID=""
+			if [ -n "$__DHCP_FILTER" ] && get_device_duid "$__IDENT" "mac" __DEVICE_DUID; then
+				if get_dhcpv6_ipv6_by_duid "$__DEVICE_DUID" "$__DHCP_FILTER" __RESULT; then
+					write_log 7 "Found IPv6 '$__RESULT' via DHCPv6 (MAC->DUID->DHCPv6)"
+					eval "$__VAR=\"$__RESULT\""
+					return 0
+				fi
+			fi
+			# Direct neighbor table lookup
+			__RESOLVED_MAC=$(printf "%s" "$__IDENT" | tr 'A-Z-' 'a-z:')
+			write_log 7 "Using MAC '$__RESOLVED_MAC' for neighbor table lookup"
+			if get_neighbor_ipv6_filtered "$__DEVICE" "$__RESOLVED_MAC" "$__ADDR_TYPE" __RESULT; then
+				eval "$__VAR=\"$__RESULT\""
+				return 0
+			fi
+			;;
+	esac
+
+	write_log 4 "Failed to find IPv6 address for device '$__IDENT' (type: $__IDENT_TYPE)"
+	return 1
+}
+
+# Convert MAC address to EUI-64 interface identifier
+# $1	MAC address (xx:xx:xx:xx:xx:xx)
+# $2	variable name to store result (format: xxxx:xxff:fexx:xxxx)
+mac_to_eui64() {
+	local __MAC="$1"
+	local __VAR="$2"
+	local __RESULT
+
+	[ -n "$__MAC" ] || return 1
+	[ -n "$__VAR" ] || return 1
+
+	# Normalize MAC to lowercase without colons
+	__MAC=$(printf "%s" "$__MAC" | tr 'A-Z' 'a-z' | tr -d ':')
+	[ ${#__MAC} -eq 12 ] || return 1
+
+	# Split MAC into parts
+	local b1 b2 b3 b4 b5 b6
+	b1=${__MAC:0:2}
+	b2=${__MAC:2:2}
+	b3=${__MAC:4:2}
+	b4=${__MAC:8:2}
+	b5=${__MAC:10:2}
+	b6=${__MAC:10:2}
+
+	# Flip the 7th bit (Universal/Local bit) of the first byte
+	local first_byte_dec first_byte_flipped
+	first_byte_dec=$((0x$b1))
+	first_byte_flipped=$(printf "%02x" $((first_byte_dec ^ 2)))
+
+	# Build EUI-64: insert ff:fe in the middle
+	__RESULT="${first_byte_flipped}${b2}:${b3}ff:fe${__MAC:6:2}:${b4}${b5}"
+
+	eval "$__VAR=\"$__RESULT\""
+	return 0
+}
+
+# Get IPv6 address for a neighbor device by MAC with type filtering
+# $1	interface device name
+# $2	MAC address of target device
+# $3	address type filter: "global", "ula", "dhcpv6", "slaac", "eui64", "any"
+# $4	variable name to store result
+get_neighbor_ipv6_filtered() {
+	local __DEVICE="$1"
+	local __TARGET_MAC
+	local __TYPE="${3:-any}"
+	local __VAR="$4"
+	local __ADDR="" __FALLBACK=""
+	local __ADDRS __LINE
+
+	[ -n "$__DEVICE" ] || return 1
+	[ -n "$2" ] || return 1
+	[ -n "$__VAR" ] || return 1
+
+	__TARGET_MAC=$(printf "%s" "$2" | tr 'A-Z' 'a-z')
+
+	# Collect all IPv6 addresses for this MAC from neighbor table
+	__ADDRS=$(ip -6 neigh show dev "$__DEVICE" 2>/dev/null | awk -v mac="$__TARGET_MAC" '
+		{
+			raw=$1
+			sub(/%.*/, "", raw)
+			lladdr=""
+			state=""
+			for (i=1; i<=NF; i++) {
+				if ($i=="lladdr") { lladdr=$(i+1) }
+				if ($i=="FAILED" || $i=="INCOMPLETE") { state=$i }
+			}
+			if (state=="FAILED" || state=="INCOMPLETE") next
+			if (tolower(lladdr)==mac) {
+				addr_lc=tolower(raw)
+				if (addr_lc ~ /^fe80:/) next
+				print raw
+			}
+		}')
+
+	[ -z "$__ADDRS" ] && return 1
+
+	# Filter addresses by type
+	for __LINE in $__ADDRS; do
+		local __LOWER
+		__LOWER=$(printf "%s" "$__LINE" | tr 'A-Z' 'a-z')
+
+		case "$__TYPE" in
+			"global")
+				# Non-ULA global address
+				case "$__LOWER" in
+					f[cd][0-9a-f][0-9a-f]:*) [ -z "$__FALLBACK" ] && __FALLBACK="$__LINE" ;;
+					*) __ADDR="$__LINE"; break ;;
+				esac
+				;;
+			"ula")
+				# ULA address only
+				case "$__LOWER" in
+					f[cd][0-9a-f][0-9a-f]:*) __ADDR="$__LINE"; break ;;
+				esac
+				;;
+			"dhcpv6")
+				# DHCPv6-like: non-EUI64 address (no fffe pattern)
+				case "$__LOWER" in
+					f[cd][0-9a-f][0-9a-f]:*) continue ;;
+					*fffe*) [ -z "$__FALLBACK" ] && __FALLBACK="$__LINE" ;;
+					*) __ADDR="$__LINE"; break ;;
+				esac
+				;;
+			"slaac"|"eui64")
+				# SLAAC/EUI-64: has fffe pattern in interface ID
+				case "$__LOWER" in
+					f[cd][0-9a-f][0-9a-f]:*) continue ;;
+					*fffe*) __ADDR="$__LINE"; break ;;
+					*) [ -z "$__FALLBACK" ] && __FALLBACK="$__LINE" ;;
+				esac
+				;;
+			"any"|*)
+				# Any address, prefer global over ULA
+				case "$__LOWER" in
+					f[cd][0-9a-f][0-9a-f]:*) [ -z "$__FALLBACK" ] && __FALLBACK="$__LINE" ;;
+					*) __ADDR="$__LINE"; break ;;
+				esac
+				;;
+		esac
+	done
+
+	# Use fallback if no exact match
+	[ -z "$__ADDR" ] && __ADDR="$__FALLBACK"
+	[ -z "$__ADDR" ] && return 1
+
+	eval "$__VAR=\"$__ADDR\""
 	return 0
 }
 
@@ -1205,7 +1872,7 @@ get_current_ip () {
 		"interface")
 			[ -z "$ip_interface" ] && { write_log 12 "get_current_ip: 'ip_interface' not set for source 'interface'"; return 2; }
 			# Test for alias interfaces e.g. "@wan6"; get the effective layer 3 interface
-			[ "${ip_interface#*'@'}" != "$ip_interface" ] && network_get_device ip_interface "$ip_interface"
+			[ "${ip_interface#*'@'}" != "$ip_interface" ] && network_get_device ip_interface "${ip_interface#@}"
 			write_log 7 "#> ip -o -br -js addr show dev '$ip_interface' scope global | $jsonfilter -e '@[0].addr_info[0].local'"
 			[ "$use_ipv6" -eq 0 ] && data=$(ip -o -4 -br -js addr show dev "$ip_interface" scope global | "$jsonfilter" -e '@[0].addr_info[0].local')
 			[ "$use_ipv6" -eq 1 ] && data=$(ip -o -6 -br -js addr show dev "$ip_interface" scope global | "$jsonfilter" -e '@[0].addr_info[0].local')
@@ -1226,12 +1893,14 @@ get_current_ip () {
 			[ -n "$data" ] && write_log 7 "Current IP '$data' detected via web at '$ip_url'"
 			;;
 		"device")
+			# Get IPv6 address of a downstream device by its identifier
+			# ip_device can be: MAC, hostname, IPv4, or DUID (auto-detected or use ip_device_type)
 			[ "$use_ipv6" -eq 1 ] || { write_log 12 "get_current_ip: 'device' source requires 'use_ipv6' enabled"; return 2; }
 			[ -n "$ip_device" ] || { write_log 12 "get_current_ip: 'ip_device' not set for source 'device'"; return 2; }
-			local __DEVNAME=""
+			local __DEVNAME="" __IDENT_TYPE="${ip_device_type:-auto}"
 			if [ -n "$ip_interface" ]; then
 				if [ "${ip_interface#@}" != "$ip_interface" ]; then
-					network_get_device __DEVNAME "$ip_interface" || { write_log 12 "get_current_ip: unable to resolve interface alias '$ip_interface'"; return 2; }
+					network_get_device __DEVNAME "${ip_interface#@}" || { write_log 12 "get_current_ip: unable to resolve interface alias '$ip_interface'"; return 2; }
 				else
 					__DEVNAME="$ip_interface"
 				fi
@@ -1242,25 +1911,54 @@ get_current_ip () {
 				return 2
 			fi
 			[ -n "$__DEVNAME" ] || { write_log 12 "get_current_ip: No usable interface resolved for source 'device'"; return 2; }
-			data=$(get_device_ipv6_address "$__DEVNAME" "$ip_device")
+			get_device_ipv6_by_ident "$__DEVNAME" "$ip_device" "$__IDENT_TYPE" "any" data
 			[ -n "$data" ] && write_log 7 "Current IP '$data' detected for device '$ip_device' on '$__DEVNAME'"
 			;;
 		"prefix")
 			# IPv6 Prefix Delegation - build address from PD prefix
+			# If ip_device is provided: first try to find device from neighbor table,
+			# if not found, build address from prefix + EUI-64 suffix derived from MAC
+			# ip_device can be: MAC, hostname, IPv4, or DUID (auto-detected or use ip_device_type)
 			[ "$use_ipv6" -eq 1 ] || { write_log 12 "get_current_ip: 'prefix' source requires 'use_ipv6' enabled"; return 2; }
 			[ -n "$ip_network" ] || { write_log 12 "get_current_ip: 'ip_network' not set for source 'prefix'"; return 2; }
-			local __PREFIX="" __SUFFIX="${ip_prefix_suffix:-::1}"
+			local __PREFIX="" __SUFFIX="${ip_prefix_suffix:-::1}" __DEVNAME="" __EUI64="" __MAC=""
+			local __IDENT_TYPE="${ip_device_type:-auto}"
 			if get_ipv6_prefix "$ip_network" __PREFIX; then
-				build_ipv6_from_prefix "$__PREFIX" "$__SUFFIX" data
-				[ -n "$data" ] && write_log 7 "Current IP '$data' built from prefix '$__PREFIX' + suffix '$__SUFFIX'"
+				if [ -n "$ip_device" ]; then
+					# Device identifier provided - try to find from neighbor table first
+					network_get_device __DEVNAME "$ip_network" 2>/dev/null
+					if [ -n "$__DEVNAME" ]; then
+						get_device_ipv6_by_ident "$__DEVNAME" "$ip_device" "$__IDENT_TYPE" "any" data
+					fi
+					# If not found from neighbor table, build address from prefix + EUI-64
+					if [ -z "$data" ]; then
+						# Resolve device identifier to MAC first
+						if resolve_device_to_mac "$ip_device" __MAC "$__IDENT_TYPE"; then
+							if mac_to_eui64 "$__MAC" __EUI64; then
+								__SUFFIX="::$__EUI64"
+								write_log 7 "Building address for device '$ip_device' (MAC: $__MAC) with EUI-64 suffix '$__SUFFIX'"
+								build_ipv6_from_prefix "$__PREFIX" "$__SUFFIX" data
+							fi
+						else
+							write_log 4 "Failed to resolve device '$ip_device' to MAC, cannot build EUI-64 address"
+						fi
+					fi
+					[ -n "$data" ] && write_log 7 "Current IP '$data' for device '$ip_device' using prefix '$__PREFIX'"
+				else
+					# No device - build router's own address from prefix + suffix
+					build_ipv6_from_prefix "$__PREFIX" "$__SUFFIX" data
+					[ -n "$data" ] && write_log 7 "Current IP '$data' built from prefix '$__PREFIX' + suffix '$__SUFFIX'"
+				fi
 			else
 				write_log 4 "No IPv6 prefix found on network '$ip_network'"
 			fi
 			;;
 		"dhcpv6")
 			# DHCPv6 assigned address
+			# If ip_device is provided, lookup the device's DHCPv6-type address
+			# ip_device can be: MAC, hostname, IPv4, or DUID (auto-detected or use ip_device_type)
 			[ "$use_ipv6" -eq 1 ] || { write_log 12 "get_current_ip: 'dhcpv6' source requires 'use_ipv6' enabled"; return 2; }
-			local __DEVNAME=""
+			local __DEVNAME="" __IDENT_TYPE="${ip_device_type:-auto}"
 			if [ -n "$ip_interface" ]; then
 				if [ "${ip_interface#@}" != "$ip_interface" ]; then
 					network_get_device __DEVNAME "${ip_interface#@}" 2>/dev/null
@@ -1271,8 +1969,15 @@ get_current_ip () {
 				network_get_device __DEVNAME "$ip_network" 2>/dev/null
 			fi
 			if [ -n "$__DEVNAME" ]; then
-				get_ipv6_address_filtered "$__DEVNAME" data "dhcpv6"
-				[ -n "$data" ] && write_log 7 "Current DHCPv6 IP '$data' detected on '$__DEVNAME'"
+				if [ -n "$ip_device" ]; then
+					# Device identifier provided - lookup from neighbor table with DHCPv6 filter
+					get_device_ipv6_by_ident "$__DEVNAME" "$ip_device" "$__IDENT_TYPE" "dhcpv6" data
+					[ -n "$data" ] && write_log 7 "Current DHCPv6 IP '$data' detected for device '$ip_device' on '$__DEVNAME'"
+				else
+					# No device - get router's own DHCPv6 address
+					get_ipv6_address_filtered "$__DEVNAME" data "dhcpv6"
+					[ -n "$data" ] && write_log 7 "Current DHCPv6 IP '$data' detected on '$__DEVNAME'"
+				fi
 			else
 				write_log 12 "get_current_ip: 'dhcpv6' source requires 'ip_interface' or 'ip_network'"
 				return 2
@@ -1280,8 +1985,10 @@ get_current_ip () {
 			;;
 		"slaac")
 			# SLAAC (Stateless Address Auto-Configuration) address
+			# If ip_device is provided, lookup the device's SLAAC address
+			# ip_device can be: MAC, hostname, IPv4, or DUID (auto-detected or use ip_device_type)
 			[ "$use_ipv6" -eq 1 ] || { write_log 12 "get_current_ip: 'slaac' source requires 'use_ipv6' enabled"; return 2; }
-			local __DEVNAME=""
+			local __DEVNAME="" __IDENT_TYPE="${ip_device_type:-auto}"
 			if [ -n "$ip_interface" ]; then
 				if [ "${ip_interface#@}" != "$ip_interface" ]; then
 					network_get_device __DEVNAME "${ip_interface#@}" 2>/dev/null
@@ -1292,8 +1999,15 @@ get_current_ip () {
 				network_get_device __DEVNAME "$ip_network" 2>/dev/null
 			fi
 			if [ -n "$__DEVNAME" ]; then
-				get_ipv6_address_filtered "$__DEVNAME" data "slaac"
-				[ -n "$data" ] && write_log 7 "Current SLAAC IP '$data' detected on '$__DEVNAME'"
+				if [ -n "$ip_device" ]; then
+					# Device identifier provided - lookup from neighbor table with SLAAC filter
+					get_device_ipv6_by_ident "$__DEVNAME" "$ip_device" "$__IDENT_TYPE" "slaac" data
+					[ -n "$data" ] && write_log 7 "Current SLAAC IP '$data' detected for device '$ip_device' on '$__DEVNAME'"
+				else
+					# No device - get router's own SLAAC address
+					get_ipv6_address_filtered "$__DEVNAME" data "slaac"
+					[ -n "$data" ] && write_log 7 "Current SLAAC IP '$data' detected on '$__DEVNAME'"
+				fi
 			else
 				write_log 12 "get_current_ip: 'slaac' source requires 'ip_interface' or 'ip_network'"
 				return 2
@@ -1301,8 +2015,10 @@ get_current_ip () {
 			;;
 		"eui64")
 			# EUI-64 based IPv6 address (derived from MAC)
+			# If ip_device is provided, lookup the device's EUI-64 address
+			# ip_device can be: MAC, hostname, IPv4, or DUID (auto-detected or use ip_device_type)
 			[ "$use_ipv6" -eq 1 ] || { write_log 12 "get_current_ip: 'eui64' source requires 'use_ipv6' enabled"; return 2; }
-			local __DEVNAME=""
+			local __DEVNAME="" __IDENT_TYPE="${ip_device_type:-auto}"
 			if [ -n "$ip_interface" ]; then
 				if [ "${ip_interface#@}" != "$ip_interface" ]; then
 					network_get_device __DEVNAME "${ip_interface#@}" 2>/dev/null
@@ -1313,8 +2029,15 @@ get_current_ip () {
 				network_get_device __DEVNAME "$ip_network" 2>/dev/null
 			fi
 			if [ -n "$__DEVNAME" ]; then
-				get_ipv6_address_filtered "$__DEVNAME" data "eui64"
-				[ -n "$data" ] && write_log 7 "Current EUI-64 IP '$data' detected on '$__DEVNAME'"
+				if [ -n "$ip_device" ]; then
+					# Device identifier provided - lookup from neighbor table with EUI-64 filter
+					get_device_ipv6_by_ident "$__DEVNAME" "$ip_device" "$__IDENT_TYPE" "eui64" data
+					[ -n "$data" ] && write_log 7 "Current EUI-64 IP '$data' detected for device '$ip_device' on '$__DEVNAME'"
+				else
+					# No device - get router's own EUI-64 address
+					get_ipv6_address_filtered "$__DEVNAME" data "eui64"
+					[ -n "$data" ] && write_log 7 "Current EUI-64 IP '$data' detected on '$__DEVNAME'"
+				fi
 			else
 				write_log 12 "get_current_ip: 'eui64' source requires 'ip_interface' or 'ip_network'"
 				return 2

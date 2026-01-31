@@ -41,7 +41,8 @@ Parameters:
  -s SCRIPT           => ip_script=SCRIPT; ip_source="script"
  -t                  => force_dnstcp=1      (default 0)
  -u URL              => ip_url=URL; ip_source="web"
- -M MAC              => ip_device=MAC; ip_source="device"
+ -M IDENT            => ip_device=IDENT (MAC/hostname/IPv4/DUID for target device)
+ -T TYPE             => ip_device_type=TYPE (auto/mac/hostname/ipv4/duid)
  -P                  => ip_source="prefix" (IPv6 PD)
  -D                  => ip_source="dhcpv6" (DHCPv6 address)
  -A                  => ip_source="slaac" (SLAAC address)
@@ -172,13 +173,75 @@ load_neighbor_hostnames() {
 
 list_device_neighbors() {
 	local __DEVICE="$1"
+	local __NETWORK="$2"
 	local __TMP __LINE __ADDR __MAC __STATE __TOK key value seen macs=""
+	local __PREFIX __PREFIX_LEN __PREFIXES=""
 
 	[ -n "$__DEVICE" ] || return 1
 
 	command -v ip >/dev/null 2>&1 || return 1
 	command -v mktemp >/dev/null 2>&1 || return 1
 	. /usr/share/libubox/jshn.sh
+
+	# Get IPv6 prefixes from the network/interface
+	if [ -n "$__NETWORK" ]; then
+		# Get prefixes delegated to this network
+		local __IFACE_JSON __PREFIX_ITEM
+		__IFACE_JSON=$($UBUS call network.interface."$__NETWORK" status 2>/dev/null)
+		if [ -n "$__IFACE_JSON" ]; then
+			if json_load "$__IFACE_JSON" 2>/dev/null; then
+				# Check ipv6-prefix-assignment (downstream prefixes)
+				if json_select "ipv6-prefix-assignment" >/dev/null 2>&1; then
+					local __IDX=1
+					while json_select "$__IDX" >/dev/null 2>&1; do
+						json_get_var __PREFIX "address"
+						json_get_var __PREFIX_LEN "mask"
+						if [ -n "$__PREFIX" ] && [ -n "$__PREFIX_LEN" ]; then
+							[ -n "$__PREFIXES" ] && __PREFIXES="$__PREFIXES "
+							__PREFIXES="${__PREFIXES}${__PREFIX}/${__PREFIX_LEN}"
+						fi
+						json_select ".." >/dev/null 2>&1
+						__IDX=$((__IDX + 1))
+					done
+					json_select ".." >/dev/null 2>&1
+				fi
+				# Also check ipv6-prefix (upstream PD)
+				if json_select "ipv6-prefix" >/dev/null 2>&1; then
+					local __IDX=1
+					while json_select "$__IDX" >/dev/null 2>&1; do
+						json_get_var __PREFIX "address"
+						json_get_var __PREFIX_LEN "mask"
+						if [ -n "$__PREFIX" ] && [ -n "$__PREFIX_LEN" ]; then
+							[ -n "$__PREFIXES" ] && __PREFIXES="$__PREFIXES "
+							__PREFIXES="${__PREFIXES}${__PREFIX}/${__PREFIX_LEN}"
+						fi
+						json_select ".." >/dev/null 2>&1
+						__IDX=$((__IDX + 1))
+					done
+					json_select ".." >/dev/null 2>&1
+				fi
+				json_cleanup
+			fi
+		fi
+	fi
+
+	# Fallback: get prefixes from interface addresses
+	if [ -z "$__PREFIXES" ] && [ -n "$__DEVICE" ]; then
+		local __ADDR_LINE
+		ip -6 addr show dev "$__DEVICE" scope global 2>/dev/null | while read -r __ADDR_LINE; do
+			case "$__ADDR_LINE" in
+				*inet6*)
+					__PREFIX=$(echo "$__ADDR_LINE" | awk '{print $2}' | cut -d'/' -f1)
+					__PREFIX_LEN=$(echo "$__ADDR_LINE" | awk '{print $2}' | cut -d'/' -f2)
+					if [ -n "$__PREFIX" ] && [ -n "$__PREFIX_LEN" ]; then
+						# Extract network prefix (first 64 bits typically)
+						__PREFIX=$(echo "$__PREFIX" | cut -d':' -f1-4)
+						echo "${__PREFIX}::/${__PREFIX_LEN:-64}"
+					fi
+					;;
+			esac
+		done | sort -u | tr '\n' ' ' | read __PREFIXES 2>/dev/null || true
+	fi
 
 	load_neighbor_hostnames
 
@@ -240,6 +303,12 @@ list_device_neighbors() {
 	rm -f "$__TMP"
 
 	json_init
+	# Add prefixes array
+	json_add_array "prefixes"
+	for __PREFIX in $__PREFIXES; do
+		[ -n "$__PREFIX" ] && json_add_string "" "$__PREFIX"
+	done
+	json_close_array
 	json_add_array "devices"
 	for __MAC in $macs; do
 		[ -n "$__MAC" ] || continue
@@ -277,8 +346,9 @@ force_ipversion=0	# Force IP Version - default 0 - No
 force_dnstcp=0		# Force TCP on DNS - default 0 - No
 is_glue=0		# Is glue record - default 0 - No
 use_https=0		# not needed but must be set
+__explicit_ipv6_source=""	# Track if explicit IPv6 source was set
 
-while getopts ":6d:fghi:l:n:p:s:M:S:tu:Lv:VPDAEx:" OPT; do
+while getopts ":6d:fghi:l:n:p:s:M:T:S:tu:Lv:VPDAEx:" OPT; do
 	case "$OPT" in
 		6)	use_ipv6=1;;
 		d)	dns_server="$OPTARG";;
@@ -286,14 +356,15 @@ while getopts ":6d:fghi:l:n:p:s:M:S:tu:Lv:VPDAEx:" OPT; do
 		g)	is_glue=1;;
 		i)	ip_interface="$OPTARG"; ip_source="interface";;
 		l)	lookup_host="$OPTARG";;
-		n)	ip_network="$OPTARG"; ip_source="network";;
+		n)	ip_network="$OPTARG";;
 		p)	proxy="$OPTARG";;
 		s)	ip_script="$OPTARG"; ip_source="script";;
-		M)	ip_device=$(printf "%s" "$OPTARG" | tr 'A-F' 'a-f'); ip_source="device"; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
-		P)	ip_source="prefix"; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
-		D)	ip_source="dhcpv6"; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
-		A)	ip_source="slaac"; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
-		E)	ip_source="eui64"; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
+		M)	ip_device="$OPTARG"; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
+		T)	ip_device_type="$OPTARG";;
+		P)	ip_source="prefix"; __explicit_ipv6_source=1; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
+		D)	ip_source="dhcpv6"; __explicit_ipv6_source=1; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
+		A)	ip_source="slaac"; __explicit_ipv6_source=1; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
+		E)	ip_source="eui64"; __explicit_ipv6_source=1; [ "$use_ipv6" -eq 0 ] && use_ipv6=1;;
 		x)	ip_prefix_suffix="$OPTARG";;
 		t)	force_dnstcp=1;;
 		u)	ip_url="$OPTARG"; ip_source="web";;
@@ -310,6 +381,17 @@ done
 shift $((OPTIND - 1 ))	# OPTIND is 1 based
 
 [ "$1" = "--" ] && shift
+
+# Determine ip_source if not explicitly set
+if [ -z "$ip_source" ]; then
+	if [ -n "$ip_device" ]; then
+		# ip_device set without explicit source -> use "device"
+		ip_source="device"
+	elif [ -n "$ip_network" ]; then
+		# ip_network set without explicit source -> use "network"
+		ip_source="network"
+	fi
+fi
 
 [ $# -eq 0 ] && usage_err "missing command"
 
@@ -346,7 +428,6 @@ case "$1" in
 			export http_proxy="http://$proxy"
 			export https_proxy="http://$proxy"
 		}
-		# don't need IP only the return code
 		IP=""
 		if [ "$ip_source" = "web" -o  "$ip_source" = "script" ]; then
 			# we wait only 3 seconds for an
@@ -358,6 +439,8 @@ case "$1" in
 			get_current_ip IP
 		fi
 		__RET=$?
+		[ $__RET -ne 0 ] && IP=""
+		printf "%s" "$IP"
 		;;
 	start)
 		[ -z "$SECTION" ] &&  usage_err "command 'start': 'SECTION' not set"
@@ -389,7 +472,7 @@ case "$1" in
 			network_get_device ip_interface "$ip_network" || usage_err "command 'list_neighbors': unable to resolve network '$ip_network'"
 		fi
 		[ -n "$ip_interface" ] || usage_err "command 'list_neighbors': 'ip_interface' or 'ip_network' required"
-		list_device_neighbors "$ip_interface"
+		list_device_neighbors "$ip_interface" "$ip_network"
 		__RET=$?
 		;;
 	*)
