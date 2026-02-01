@@ -10,18 +10,47 @@
 #
 # This script is parsed by dynamic_dns_functions.sh inside send_update() function
 #
-# using following options from /etc/config/ddns
-# option username  - your cloudflare e-mail (not required when using API token via param_opt)
-# option password  - cloudflare api key, you can get it from cloudflare.com/my-account/
-# option domain    - "hostname@yourdomain.TLD"
-# option param_opt - (Optional) key=value pairs that are separated by space
-#                    if duplicate keys found, only the last occurrence will be used
-#                    example: "zone_id=123456789 dns_record_id=987654321"
-#                    current supported keys:
-#                    1. zone_id (API: GET https://api.cloudflare.com/client/v4/zones)
-#                       note: zone_id must be specified if dns_record_id is specified
-#                    2. dns_record_id (API: GET https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records)
-#                    3. api_token / zone_api_token (Cloudflare API Token string; enables Authorization: Bearer mode)
+# ============================================================================
+# Authentication Methods (choose one):
+# ============================================================================
+#
+# Method 1: Global API Key (legacy)
+#   option username  - your cloudflare email
+#   option password  - your Global API Key (from cloudflare.com/profile/api-tokens)
+#
+# Method 2: API Token (recommended)
+#   option username  - set to "Bearer"
+#   option password  - your API Token
+#   Note: Token needs permissions: Zone:Read, DNS:Edit
+#
+# Method 3: API Token via param_opt
+#   option param_opt - "api_token=YOUR_TOKEN"
+#   Note: Same as Method 2, but token is passed via param_opt
+#
+# ============================================================================
+# Other Options:
+# ============================================================================
+#
+# option domain    - hostname@yourdomain.TLD (e.g. www@example.com)
+#                    Use @example.com for the root domain
+#
+# option param_opt - Optional key=value pairs separated by space:
+#                    - zone_id=xxx         : Cloudflare Zone ID (speeds up API calls)
+#                    - dns_record_id=xxx   : DNS Record ID (requires zone_id)
+#                    - api_token=xxx       : API Token (alternative to Method 2)
+#                    - zone_api_token=xxx  : Same as api_token (alias)
+#
+# ============================================================================
+# How to get Zone ID:
+#   1. Go to Cloudflare Dashboard -> select your domain
+#   2. Scroll down on the Overview page, find "Zone ID" on the right side
+#   Or use API: curl -X GET "https://api.cloudflare.com/client/v4/zones" \
+#               -H "Authorization: Bearer YOUR_TOKEN"
+#
+# How to get DNS Record ID:
+#   Use API: curl -X GET "https://api.cloudflare.com/client/v4/zones/ZONE_ID/dns_records" \
+#            -H "Authorization: Bearer YOUR_TOKEN"
+# ============================================================================
 #
 # The proxy status would not be changed by this script. Please change it in Cloudflare dashboard manually.
 #
